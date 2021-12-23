@@ -418,7 +418,7 @@ class VisionSystem():
         
         while True:
             time.sleep(0.001)
-            if len(depthDataQueue)>5:
+            if len(depthDataQueue)>50:
                 depthDataQueue.pop(0)
                 
             counter+=1
@@ -434,9 +434,10 @@ class VisionSystem():
             height = 720 #frame.shape[0]
             width  = 720 #1280 #frame.shape[1]
             
-            bbSpatial = self.faceSpatialConfigBB.tryGet()                
-            if bbSpatial is not None:
-                spatial = self.faceSpatialDataQueue.get()
+            spatial = self.faceSpatialDataQueue.tryGet()
+
+            if spatial is not None:
+                bbSpatial = self.faceSpatialConfigBB.get()                                
                 bb = json.loads(str(bbSpatial.getData(), 'utf-8'))
                 spatialData = spatial.getSpatialLocations()
                 for depthData in spatialData:
