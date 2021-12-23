@@ -1,7 +1,5 @@
 
 # license removed for brevity
-import rospy
-import actionlib
 import math
 import os
 from pathlib import Path
@@ -12,14 +10,13 @@ import numpy as np
 import argparse
 import time
 import blobconverter
-import rospkg
 import threading
 from queue import Queue
 
-from tf.transformations import *
-from tf import TransformListener
-import tf
-from std_msgs.msg import String
+#from tf.transformations import *
+#from tf import TransformListener
+#import tf
+#from std_msgs.msg import String
 
 import time
 import json
@@ -49,7 +46,7 @@ class FaceRecognition:
         self.text_type = cv2.FONT_HERSHEY_SIMPLEX
         self.line_type = cv2.LINE_AA
         self.printed = True
-        #self.name = "John"
+        #self.name = "Tammy"
 
     def cosine_distance(self, a, b):
         if a.shape != b.shape:
@@ -87,6 +84,8 @@ class FaceRecognition:
 
         self.db_dic = {}
         for label in self.labels:
+            file = databases_path+"/"+label+".npz"
+            print(file)
             with np.load(f"{databases_path}/{label}.npz") as db:
                 self.db_dic[label] = [db[j] for j in db.files]
 
@@ -119,8 +118,9 @@ class VisionSystem():
       parser = argparse.ArgumentParser()
       parser.add_argument("-name", "--name", type=str, help="Name of the person for database saving")
       self.args = parser.parse_args() 
-      rospack = rospkg.RosPack()
-      self.packageDir = rospack.get_path('floyd')
+      #rospack = rospkg.RosPack()
+      #self.packageDir = rospack.get_path('floyd')
+      self.packageDir = "."
           
       self.databases = self.packageDir+"/databases"
       print(self.databases)
@@ -142,7 +142,7 @@ class VisionSystem():
         "toaster",        "sink",       "refrigerator",  "book",          "clock",       "vase",          "scissors",
         "teddy bear",     "hair drier", "toothbrush"
       ]
-      self.speakPub = rospy.Publisher("mycroft/speak", String, queue_size=10)
+      #self.speakPub = rospy.Publisher("mycroft/speak", String, queue_size=10)
 
       self.syncNN = True
       self.createPipeline()
@@ -161,6 +161,8 @@ class VisionSystem():
       self.faceSpatialConfigQueue =self.device.getOutputQueue(name="spatialFaceConfig", maxSize=4, blocking=False)
       self.faceSpatialConfigBB =self.device.getOutputQueue(name="spatialFaceConfigBB_out", maxSize=8, blocking=False)
       self.faceRecognitionBB =self.device.getOutputQueue(name="face_recBB_out", maxSize=8, blocking=False)
+      if True:
+        self.faceQ = self.device.getOutputQueue("face", 4, False)
       
       self.displayFaceQueue = Queue(maxsize = 10)
       self.displayYoloQueue = Queue(maxsize = 10)
@@ -214,7 +216,8 @@ class VisionSystem():
       # We are only interested in timestamp, so we can sync depth frames with NN output
       self.face_det_nn.passthrough.link(self.script.inputs['face_pass'])
       
-      with open(self.packageDir+"/src/floyd/script.py", "r") as f:
+      #with open(self.packageDir+"/src/floyd/script1.py", "r") as f:
+      with open("script1.py", "r") as f:
           self.script.setScript(f.read())
       
       # ImageManip as a workaround to have more frames in the pool.
@@ -327,7 +330,8 @@ class VisionSystem():
       #self.stereo.initialConfig.setConfidenceThreshold(255)
       #self.stereo.setLeftRightCheck(True)
       #self.stereo.setSubpixel(False)
-      self.stereo.setDefaultProfilePreset(dai.node.StereoDepth.PresetMode.HIGH_DENSITY)
+      
+      #self.stereo.setDefaultProfilePreset(dai.node.StereoDepth.PresetMode.HIGH_DENSITY)
       
       self.spatialFaceCalc = self.pipeline.create(dai.node.SpatialLocationCalculator)
       self.spatialFaceCalc.setWaitForConfigInput(False)
@@ -393,7 +397,11 @@ class VisionSystem():
       self.stereo.depth.link(self.yoloDetectionNetwork.inputDepth)
       self.yoloDetectionNetwork.passthroughDepth.link(self.xoutDepth.input)
     
-
+      if True:
+        self.xout_face = self.pipeline.createXLinkOut()
+        self.xout_face.setStreamName('face')
+        self.face_rec_manip.out.link(self.xout_face.input)
+        
     def runFacePipeline(self):
         firstTime = time.monotonic()
         startTime = time.monotonic()
@@ -405,10 +413,14 @@ class VisionSystem():
         facerec = FaceRecognition(self.databases, self.args.name)
         lastPersonAnnouncement = 0
         lastObjectAnnouncement = 0
-
+        
+        depthDataQueue = []
+        
         while True:
             time.sleep(0.001)
-   
+            if len(depthDataQueue)>5:
+                depthDataQueue.pop(0)
+                
             counter+=1
             current_time = time.monotonic()
             if (current_time - startTime) > 1 :
@@ -420,29 +432,42 @@ class VisionSystem():
     
     
             height = 720 #frame.shape[0]
-            width  = 1280 #frame.shape[1]
+            width  = 720 #1280 #frame.shape[1]
+            
+            bbSpatial = self.faceSpatialConfigBB.tryGet()                
+            if bbSpatial is not None:
+                spatial = self.faceSpatialDataQueue.get()
+                bb = json.loads(str(bbSpatial.getData(), 'utf-8'))
+                spatialData = spatial.getSpatialLocations()
+                for depthData in spatialData:
+                    queueEntry = {
+                         'bb': bb,
+                         'depthData': depthData
+                    }
+                    depthDataQueue.append(queueEntry)
             
             cfg = self.recCfgQ.tryGet()
             results = {}
             if cfg is not None:
-                bbSpatial = self.faceSpatialConfigBB.get()
-                
+                faceBBdata = self.faceRecognitionBB.get()
+                faceBB = json.loads(str(faceBBdata.getData(), 'utf-8'))
                 rr = cfg.getRaw().cropConfig.cropRotatedRect
                 arcIn = self.arcQ.get()
-                center = (int(rr.center.x * width), int(rr.center.y * height))
+                center = (int(rr.center.x * width+(1280-720)/2), int(rr.center.y * height))
                 size = (int(rr.size.width * width), int(rr.size.height * height))
                 rotatedRect = (center, size, rr.angle)
                 points = np.int0(cv2.boxPoints(rotatedRect))
                 features = np.array(arcIn.getFirstLayerFp16())
                 conf, name = facerec.new_recognition(features)
                 
+                '''
                 if time.time() - lastPersonAnnouncement > 10*60:
                    if name == "UNKNOWN":
                        self.speakPub.publish("Detected unknown person")
                    else:
                        self.speakPub.publish("Detected %s" % name)
                    lastPersonAnnouncement = time.time()
-                
+                '''
                 result = {
                     'name': name,
                     'conf': conf,
@@ -450,15 +475,21 @@ class VisionSystem():
                     'points': points,
                     'ts': time.time(),
                 }
-                bb = json.loads(str(bbSpatial.getData(), 'utf-8'))
-                spatialData = self.faceSpatialDataQueue.get().getSpatialLocations()
-                for depthData in spatialData:
-                    print(f"{name} at {(depthData.spatialCoordinates.x/1000):.2f}, {(depthData.spatialCoordinates.y/1000):.2f}, {(depthData.spatialCoordinates.z/1000):.2f}, {conf:.2f}, {bb['xmin']:.2f},{bb['ymin']:.2f} / {bb['xmax']:.2f}, {bb['ymax']:.2f}")
-                    result['x']=depthData.spatialCoordinates.x
-                    result['y']=depthData.spatialCoordinates.y
-                    result['z']=depthData.spatialCoordinates.z
-                self.displayFaceQueue.put(result)
-            
+                #print("face:"+str(faceBB))                
+                for x in range(len(depthDataQueue)):
+                    depthData = depthDataQueue[x]
+                    bbEntry = depthData['bb']
+                    depthDataEntry = depthData['depthData']
+                    #print("depth:"+str(bbEntry))
+                    if abs(bbEntry['xmin']-faceBB['xmin'])<0.001 and abs(bbEntry['xmax']-faceBB['xmax'])<0.001 and abs(bbEntry['ymax']-faceBB['ymax'])<0.001 and abs(bbEntry['ymin']-faceBB['ymin'])<0.001:
+                        result['x']=depthDataEntry.spatialCoordinates.x
+                        result['y']=depthDataEntry.spatialCoordinates.y
+                        result['z']=depthDataEntry.spatialCoordinates.z
+                        depthDataQueue.pop(x)
+
+                        print(f"{result['name']} at {(result['x']/1000):.2f}, {(result['y']/1000):.2f}, {(result['z']/1000):.2f}, {result['conf']:.2f}, {bb['xmin']:.2f},{bb['ymin']:.2f} / {bb['xmax']:.2f}, {bb['ymax']:.2f}")
+                        self.displayFaceQueue.put(result)
+                        break            
                 
 
            
@@ -493,8 +524,8 @@ class VisionSystem():
                           label = self.labelMap[detection.label]
                       except:
                           label = detection.label
-                      if label != "person":
-                          self.speakPub.publish("Detected %s" % label)
+                      #if label != "person":
+                      #    self.speakPub.publish("Detected %s" % label)
                   lastObjectAnnouncement = time.time()
     
     
@@ -576,7 +607,18 @@ class VisionSystem():
             cv2.rectangle(frame, (x1, y1), (x2, y2), color, cv2.FONT_HERSHEY_SIMPLEX)
         '''
         #cv2.putText(frame, "NN fps: {:.2f}".format(fps), (2, frame.shape[0] - 4), cv2.FONT_HERSHEY_TRIPLEX, 0.4, color)
-
+        if True:
+            if self.faceQ.has():
+                cv2.imshow('face', self.faceQ.get().getCvFrame())
         cv2.imshow("rgb2", frame)
         if cv2.waitKey(1) == ord('q'):
            break
+
+           
+if __name__ == '__main__':
+    print("instantiating vision system.")
+    _vision=VisionSystem()
+    while True:
+      time.sleep(0.1)
+      if False:
+         break

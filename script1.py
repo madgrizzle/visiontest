@@ -78,25 +78,29 @@ while True:
             spatialConfigData.depthThresholds.upperThreshold = 10000
             
             frameSize = 720
-            det.xmax = (det.xmax*frameSize+(1280-frameSize)/2)/1280
-            det.ymax = (det.ymax*frameSize+(720-frameSize)/2)/720
-            det.xmin = (det.xmin*frameSize+(1280-frameSize)/2)/1280
-            det.ymin = (det.ymin*frameSize+(720-frameSize)/2)/720
 
-            centerx = (det.xmax + det.xmin)/2.0
-            centery = (det.ymax + det.ymin)/2.0
+            xmax = (det.xmax*frameSize+(1280-frameSize)/2)/1280
+            ymax = (det.ymax*frameSize+(720-frameSize)/2)/720
+            xmin = (det.xmin*frameSize+(1280-frameSize)/2)/1280
+            ymin = (det.ymin*frameSize+(720-frameSize)/2)/720
+
+            centerx = (xmax + xmin)/2.0
+            centery = (ymax + ymin)/2.0
             #node.warn(f"0:{det.xmax},{det.ymax} {det.xmin},{det.ymin}")
             #node.warn(f"0:{det.xmax-det.xmin},{det.ymax-det.ymin}")
-            det.xmax = (det.xmax-centerx)*faceROIScale+centerx
-            det.ymax = (det.ymax-centery)*faceROIScale+centery
-            det.xmin = (det.xmin-centerx)*faceROIScale+centerx
-            det.ymin = (det.ymin-centery)*faceROIScale+centery
-            correct_bb(det)
+            xmax = (xmax-centerx)*faceROIScale+centerx
+            ymax = (ymax-centery)*faceROIScale+centery
+            xmin = (xmin-centerx)*faceROIScale+centerx
+            ymin = (ymin-centery)*faceROIScale+centery
+            if xmin < 0: xmin = 0.0
+            if ymin < 0: ymin = 0.0
+            if xmax > 1: xmax = 0.999
+            if ymax > 1: ymax = 0.999
             #node.warn(f"1:{det.xmax},{det.ymax} {det.xmin},{det.ymin}")
             #node.warn(f"1:{det.xmax-det.xmin},{det.ymax-det.ymin}")
             #node.warn(f"1:{centerx},{centery}")
-            bottomRight = Point2f(det.xmax, det.ymax)
-            topLeft = Point2f(det.xmin, det.ymin)
+            bottomRight = Point2f(xmax, ymax)
+            topLeft = Point2f(xmin, ymin)
             spatialConfigData.roi = Rect(topLeft, bottomRight)
             
             spatialConfigData.calculationAlgorithm = SpatialLocationCalculatorAlgorithm.AVERAGE
