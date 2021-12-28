@@ -54,7 +54,8 @@ import numpy as np
 import time
 from queue import Queue
 import threading
-import pyray as pr
+import pyray as ray
+from ctypes import *
 
 print(dai.__version__)
 
@@ -335,20 +336,32 @@ class VisionSystem:
     def runRaylibDisplayThread(self):
         text = TextHelper()
 
-        pr.init_window(800, 450, "Hello Raylib")
-        pr.set_target_fps(60)
-
+        ray.init_window(800, 450, "Hello Raylib")
+        ray.toggle_fullscreen()
+        ray.hide_cursor()
+        ray.set_target_fps(60)
+        ray.set_trace_log_level(ray.LOG_ERROR)
+        width = ray.get_screen_width()
+        height = ray.get_screen_height()
+        print(width)
         while True:
             time.sleep(0.001)
-            while not pr.window_should_close():
+            while not ray.window_should_close():
                 if not self.raylibDisplayFaceQueue.empty():
                     result=self.raylibDisplayFaceQueue.get()
                     frame = result['face'].getCvFrame()
-                    #is_success, im_buff_arr = cv2.imencode(".png", frame)
                     rayframe = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                    image = pr.Image(rayframe.tostring(),frame.shape[1],frame.shape[0],1,pr.PIXELFORMAT_UNCOMPRESSED_R8G8B8)
-                    #image = pr.load_image_from_memory(".png", im_buff_arr, frame.size)
-            pr.close_window()
+                    ffiData = ray.ffi.from_buffer(rayframe.data)
+                    image = ray.Image(ffiData,frame.shape[1],frame.shape[0],1,ray.PIXELFORMAT_UNCOMPRESSED_R8G8B8)
+                    #image1 = ray.image_resize(image, width, height)
+                    texture = ray.load_texture_from_image(image)
+                    #ray.unload_image(image)
+                    ray.begin_drawing()
+                    ray.clear_background(ray.RAYWHITE)
+                    ray.draw_texture(texture, int(200-frame.shape[1]/2), int(225-frame.shape[0]), ray.WHITE)
+                    ray.end_drawing()
+            ray.unload_texture(texture)
+            ray.close_window()
     
     def runVideoDisplayThread(self):
         text = TextHelper()
@@ -380,7 +393,7 @@ class VisionSystem:
                     
                 if OBJECT:
                     if not self.videoDisplayObjectQueue.empty():
-                        detections = self.displayObjectQueue.get()
+                        detections = self.videoDisplayObjectQueue.get()
                         for detection in detections:
                             # Denormalize bounding box
                             x2 = int(detection.xmax*width)
