@@ -55,7 +55,8 @@ import time
 from queue import Queue
 import threading
 import pyray as ray
-from ctypes import *
+import math
+#from ctypes import *
 
 print(dai.__version__)
 
@@ -73,6 +74,22 @@ databases = "databases"
 if not os.path.exists(databases):
     os.mkdir(databases)
 
+# Tiny yolo v3/4 label texts
+labelMap = [
+    "person",         "bicycle",    "car",           "motorbike",     "aeroplane",   "bus",           "train",
+    "truck",          "boat",       "traffic light", "fire hydrant",  "stop sign",   "parking meter", "bench",
+    "bird",           "cat",        "dog",           "horse",         "sheep",       "cow",           "elephant",
+    "bear",           "zebra",      "giraffe",       "backpack",      "umbrella",    "handbag",       "tie",
+    "suitcase",       "frisbee",    "skis",          "snowboard",     "sports ball", "kite",          "baseball bat",
+    "baseball glove", "skateboard", "surfboard",     "tennis racket", "bottle",      "wine glass",    "cup",
+    "fork",           "knife",      "spoon",         "bowl",          "banana",      "apple",         "sandwich",
+    "orange",         "broccoli",   "carrot",        "hot dog",       "pizza",       "donut",         "cake",
+    "chair",          "sofa",       "pottedplant",   "bed",           "diningtable", "toilet",        "tvmonitor",
+    "laptop",         "mouse",      "remote",        "keyboard",      "cell phone",  "microwave",     "oven",
+    "toaster",        "sink",       "refrigerator",  "book",          "clock",       "vase",          "scissors",
+    "teddy bear",     "hair drier", "toothbrush"
+]    
+    
 class HostSync:
     def __init__(self):
         self.array = []
@@ -176,6 +193,71 @@ class FaceRecognition:
         np.savez_compressed(f"{databases}/{self.name}", *db_)
         self.adding_new = False
 
+class TrackedObjectManager:
+    '''
+    This class is intended to manage the tracked objects, determine which
+    detection belongs to which object, and attempt to allow for multiple objects
+    of the same label to be tracked.  It will accomplish this by tracking their locations
+    and determine which detection belongs to which object.
+    '''
+    def __init__(self):
+        print("initializing tracked object manager")
+        self.trackedObjects = []
+        self.objectLocationThreshold = 20 #20 mm threshold
+        
+    def processDetection(self, detection):
+        candidate = None
+        for object in self.trackedObjects:
+            if object.label == detection.label:
+                distance = self.computeDistanceOfDetectionFromObject(object.currentLocation, detection.spatialCoordinates )
+                if distance < self.objectLocationThreshold:
+                    if candidate is not None:
+                        if candidate[1] > distance:  #if further away
+                            candidate = (object, distance)
+                    else:
+                        candidate = (object, distance)
+        if candidate is None: #no matching objects found, so create new object
+            newObject = TrackedObject(detection.label,detection.spatialCoordinates)
+            self.trackedObjects.append(newObject)
+            print(f"new {newObject.getName()} being tracked")
+        else:
+            candidate[0].updateLocation(detection.spatialCoordinates)
+            print(f"{candidate[0].getName()} position updated.")
+                
+    def computeDistanceOfDetectionFromObject(self, l, c):
+        return math.sqrt( (l[0]-c.x)**2 + (l[1]-c.y)**2 + (l[2]-c.z)**2 )
+        
+class TrackedObject:
+
+    
+    def __init__(self):
+        self.ID = 0
+        self.label = 0
+        self.name = 0
+        self.currentLocation = (0, 0, 0)
+        self.currentVelocity = (0, 0, 0)
+        
+    def __init__(self, label, c):
+        self.ID = 0
+        self.label = label
+        try:
+            self.name = labelMap[label]
+        except:
+            self.name = label
+        self.currentLocation = (c.x, c.y, c.z)
+        self.currentVelocity = (0, 0, 0)
+        
+    def updateLocation(self, c):
+        #todo: add one euro filter
+        self.currentLocation = (c.x, c.y, c.z)
+        
+    def getName(self):
+        return self.name
+        
+    
+        
+        
+        
 class VisionSystem:
 
     def __init__(self):
@@ -191,21 +273,7 @@ class VisionSystem:
         if not os.path.exists(self.databases):
             os.mkdir(self.databases)
         
-        # Tiny yolo v3/4 label texts
-        self.labelMap = [
-            "person",         "bicycle",    "car",           "motorbike",     "aeroplane",   "bus",           "train",
-            "truck",          "boat",       "traffic light", "fire hydrant",  "stop sign",   "parking meter", "bench",
-            "bird",           "cat",        "dog",           "horse",         "sheep",       "cow",           "elephant",
-            "bear",           "zebra",      "giraffe",       "backpack",      "umbrella",    "handbag",       "tie",
-            "suitcase",       "frisbee",    "skis",          "snowboard",     "sports ball", "kite",          "baseball bat",
-            "baseball glove", "skateboard", "surfboard",     "tennis racket", "bottle",      "wine glass",    "cup",
-            "fork",           "knife",      "spoon",         "bowl",          "banana",      "apple",         "sandwich",
-            "orange",         "broccoli",   "carrot",        "hot dog",       "pizza",       "donut",         "cake",
-            "chair",          "sofa",       "pottedplant",   "bed",           "diningtable", "toilet",        "tvmonitor",
-            "laptop",         "mouse",      "remote",        "keyboard",      "cell phone",  "microwave",     "oven",
-            "toaster",        "sink",       "refrigerator",  "book",          "clock",       "vase",          "scissors",
-            "teddy bear",     "hair drier", "toothbrush"
-        ]
+
         
         self.pipeline = self.createPipeline()
         
@@ -214,10 +282,10 @@ class VisionSystem:
         cameraModel = cameraInfo[dai.CameraBoardSocket.RGB]
         if cameraModel == "IMX214":
             self.FPS = 30
-            self.frameSkip = 10
+            self.frameSkip = 6
         else:
             self.FPS = 30
-            self.frameSkip = 10
+            self.frameSkip = 6
         
         if PREVIEW:
             self.frameQ = self.device.getOutputQueue("frame", 15, False)
@@ -239,6 +307,7 @@ class VisionSystem:
         if OBJECT:
             self.objectQ = self.device.getOutputQueue(name="objectDetections", maxSize=15, blocking=False)
             self.videoDisplayObjectQueue = Queue(maxsize = 20)
+            self.trackedObjectManager = TrackedObjectManager()
             self.objectThread = threading.Thread(target=self.runObjectThread)
             self.objectThread.daemon = True
             self.objectThread.start()
@@ -311,7 +380,7 @@ class VisionSystem:
                 conf, name = facerec.new_recognition(result['features'])
                 result['name'] = name
                 result['conf'] = conf
-                print(f"{result['name']} at {(100*result['conf']):.0f}%, {result['x']:.2f}, {result['y']:.2f}, {result['z']:.2f},")
+                #print(f"{result['name']} at {(100*result['conf']):.0f}%, {result['x']:.2f}, {result['y']:.2f}, {result['z']:.2f},")
                 if PREVIEW:
                     self.videoDisplayFaceQueue.put(result)
                 if DISPLAY_FACE:
@@ -328,21 +397,24 @@ class VisionSystem:
                 if len(detections)>0:
                     for detection in detections:    
                         try:
-                            label = self.labelMap[detection.label]
+                            label = labelMap[detection.label]
                         except:
                             label = detection.label
-                        print(f"{label} at {detection.spatialCoordinates.x:.2f}, {detection.spatialCoordinates.y:.2f}, {detection.spatialCoordinates.z:.2f}")
+                        self.trackedObjectManager.processDetection(detection)
+                        #print(f"{label} at {detection.spatialCoordinates.x:.2f}, {detection.spatialCoordinates.y:.2f}, {detection.spatialCoordinates.z:.2f}")
     
     def runRaylibDisplayThread(self):
         text = TextHelper()
 
         ray.init_window(800, 450, "Hello Raylib")
-        ray.toggle_fullscreen()
+        #ray.toggle_fullscreen()
         ray.hide_cursor()
         ray.set_target_fps(60)
         ray.set_trace_log_level(ray.LOG_ERROR)
-        width = ray.get_screen_width()
-        height = ray.get_screen_height()
+        #width = ray.get_screen_width()
+        #height = ray.get_screen_height()
+        width = 800
+        height = 450
         print(width)
         while True:
             time.sleep(0.001)
@@ -353,12 +425,13 @@ class VisionSystem:
                     rayframe = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                     ffiData = ray.ffi.from_buffer(rayframe.data)
                     image = ray.Image(ffiData,frame.shape[1],frame.shape[0],1,ray.PIXELFORMAT_UNCOMPRESSED_R8G8B8)
-                    #image1 = ray.image_resize(image, width, height)
                     texture = ray.load_texture_from_image(image)
                     #ray.unload_image(image)
                     ray.begin_drawing()
                     ray.clear_background(ray.RAYWHITE)
-                    ray.draw_texture(texture, int(200-frame.shape[1]/2), int(225-frame.shape[0]), ray.WHITE)
+                    scale = 450/frame.shape[0]
+                    vector = ray.Vector2(int(200-frame.shape[1]/2), 0)
+                    ray.draw_texture_ex(texture, vector, 0, scale, ray.WHITE)
                     ray.end_drawing()
             ray.unload_texture(texture)
             ray.close_window()
@@ -401,7 +474,7 @@ class VisionSystem:
                             x1 = int(detection.xmin*width)
                             y1 = int(detection.ymin*height)
                             try:
-                                label = self.labelMap[detection.label]
+                                label = labelMap[detection.label]
                             except:
                                 label = detection.label
                             cv2.putText(frame, str(label), (x1 + 10, y1 + 20), cv2.FONT_HERSHEY_TRIPLEX, 0.5, 255)
