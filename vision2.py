@@ -193,90 +193,6 @@ class FaceRecognition:
         np.savez_compressed(f"{databases}/{self.name}", *db_)
         self.adding_new = False
 
-class TrackedObjectManager:
-    '''
-    This class is intended to manage the tracked objects, determine which
-    detection belongs to which object, and attempt to allow for multiple objects
-    of the same label to be tracked.  It will accomplish this by tracking their locations
-    and determine which detection belongs to which object.
-    '''
-    def __init__(self):
-        print("initializing tracked object manager")
-        self.trackedObjects = []
-        self.objectLocationThreshold = [
-            40,               40,           200,              100,            10000,         5000,            6000,
-            300,              400,         100,              300,            500,           200,             50,
-            20,               20,           40,               100,            40,            100,             200,
-            100,             100,           200,              20,             20,            20,              20,
-            30,               20,           20,               20,             20,            100,             20,
-            20,               20,           50,               20,             20,            10,              10,
-            5,                5,             5,               10,             10,            10,              10,
-            5,                5,             5,                5,             20,            5,               20,
-            20,               100,          50,               50,             100,           200,             10,
-            10,               20,           20,               20,             40,            100,             50,
-            50,               50,           100,              5,              100,           20,              20,
-            50,               50,           10,
-        ]
-
-    def processDetection(self, detection, time):
-        candidate = None
-        maxDistance = 0
-        distance = -1
-        for object in self.trackedObjects:
-            if object.label == detection.label:
-                distanceToCurrent = self.computeDistanceOfDetectionFromObject(object.currentLocation, detection.spatialCoordinates, time )
-                distanceToPrevious = self.computeDistanceOfDetectionFromObject(object.previousLocation, detection.spatialCoordinates, time )
-                distance = distanceToCurrent if distanceToCurrent<distanceToPrevious else distanceToPrevious
-                if distance < self.objectLocationThreshold[detection.label]:
-                    if candidate is not None:
-                        if candidate[1] > distance:  #if further away
-                            candidate = (object, distance)
-                    else:
-                        candidate = (object, distance)
-                else:
-                    if distance > maxDistance:
-                        maxDistance = distance
-        if candidate is None: #no matching objects found, so create new object
-            newObject = TrackedObject(detection.label,detection.spatialCoordinates, time)
-            self.trackedObjects.append(newObject)
-            print(f"new {newObject.getName()} being tracked due to distance = {maxDistance:0.2f}")
-            print(f"{detection.spatialCoordinates.x:0.2f}, {detection.spatialCoordinates.y:0.2f}, {detection.spatialCoordinates.z:0.2f}")
-        else:
-            candidate[0].updateLocation(detection.spatialCoordinates, time)
-            print(f"{candidate[0].getName()} position updated, ({detection.spatialCoordinates.x:0.2f}, {detection.spatialCoordinates.y:0.2f}, {detection.spatialCoordinates.z:0.2f}) distance = {candidate[1]:0.2f}.")
-
-    def computeDistanceOfDetectionFromObject(self, l, c, t):
-        return math.sqrt( (l[0]-c.x)**2 + (l[1]-c.y)**2 + (l[2]-c.z)**2 ) / (t-l[3]) / 10 #scaling factor
-
-class TrackedObject:
-
-
-    def __init__(self):
-        self.ID = 0
-        self.label = 0
-        self.name = 0
-        self.previousLocation = (0, 0, 0, 0)
-        self.currentLocation = (0, 0, 0, 0)
-        self.currentVelocity = (0, 0, 0)
-
-    def __init__(self, label, c, t):
-        self.ID = 0
-        self.label = label
-        try:
-            self.name = labelMap[label]
-        except:
-            self.name = label
-        self.previousLocation = (c.x, c.y, c.z, t)
-        self.currentLocation = (c.x, c.y, c.z,t )
-        self.currentVelocity = (0, 0, 0)
-
-    def updateLocation(self, c, t):
-        #todo: add one euro filter
-        self.previousLocation = (self.currentLocation[0], self.currentLocation[1], self.currentLocation[2], self.currentLocation[3])
-        self.currentLocation = (c.x, c.y, c.z, t)
-
-    def getName(self):
-        return self.name
 
 
 
@@ -330,6 +246,7 @@ class VisionSystem:
 
         if OBJECT:
             self.objectQ = self.device.getOutputQueue(name="objectDetections", maxSize=15, blocking=False)
+            self.yoloSyncQ = self.device.getOutputQueue(name="yoloSyncOut", maxSize=15, blocking=False)
             self.videoDisplayObjectQueue = Queue(maxsize = 20)
             self.trackedObjectManager = TrackedObjectManager()
             self.objectThread = threading.Thread(target=self.runObjectThread)
@@ -416,9 +333,12 @@ class VisionSystem:
             inDet = self.objectQ.tryGet()
             if inDet is not None:
                 detections = inDet.detections
+                data = self.yoloSyncQ.get().getData()
+                jsonstr = str(data, 'utf-8')
+                yoloSync = json.loads(jsonstr)
                 if PREVIEW:
                     self.videoDisplayObjectQueue.put(detections)
-                if len(detections)>0:
+                if yoloSync == 1 and len(detections)>0:
                     for detection in detections:
                         try:
                             label = labelMap[detection.label]
@@ -684,6 +604,7 @@ class VisionSystem:
             yoloDetectionNetwork.setBoundingBoxScaleFactor(0.25)
             yoloDetectionNetwork.setDepthLowerThreshold(100)
             yoloDetectionNetwork.setDepthUpperThreshold(5000)
+            yoloDetectionNetwork.setSpatialCalculationAlgorithm(dai.SpatialLocationCalculatorAlgorithm.MIN)
 
             # Yolo specific parameters
             yoloDetectionNetwork.setNumClasses(80)
@@ -702,9 +623,103 @@ class VisionSystem:
             xoutNN = pipeline.create(dai.node.XLinkOut)
             xoutNN.setStreamName("objectDetections")
             yoloDetectionNetwork.out.link(xoutNN.input)
+            
+            yoloDetectionNetwork.passthrough.link(script.inputs['yoloPass'])
+            yoloDetectionNetwork.passthroughDepth.link(script.inputs['yoloPassDepth'])
 
+            yoloSync_out = pipeline.create(dai.node.XLinkOut)
+            yoloSync_out.setStreamName('yoloSyncOut')
+            script.outputs['yoloSync'].link(yoloSync_out.input)
+            
+            
         return pipeline
 
+class TrackedObjectManager:
+    '''
+    This class is intended to manage the tracked objects, determine which
+    detection belongs to which object, and attempt to allow for multiple objects
+    of the same label to be tracked.  It will accomplish this by tracking their locations
+    and determine which detection belongs to which object.
+    '''
+    def __init__(self):
+        print("initializing tracked object manager")
+        self.trackedObjects = []
+        self.objectLocationThreshold = [
+            40,               40,           200,              100,            10000,         5000,            6000,
+            300,              400,         100,              300,            500,           200,             50,
+            20,               20,           40,               100,            40,            100,             200,
+            100,             100,           200,              20,             20,            20,              20,
+            30,               20,           20,               20,             20,            100,             20,
+            20,               20,           50,               20,             20,            10,              10,
+            5,                5,             5,               10,             10,            10,              10,
+            5,                5,             5,                5,             20,            5,               20,
+            20,               100,          50,               50,             100,           200,             10,
+            10,               20,           20,               20,             40,            100,             50,
+            50,               50,           100,              5,              100,           20,              20,
+            50,               50,           10,
+        ]
+
+    def processDetection(self, detection, time):
+        candidate = None
+        maxDistance = 0
+        distance = -1
+        for object in self.trackedObjects:
+            if object.label == detection.label:
+                distanceToCurrent = self.computeDistanceOfDetectionFromObject(object.currentLocation, detection.spatialCoordinates, time )
+                distanceToPrevious = self.computeDistanceOfDetectionFromObject(object.previousLocation, detection.spatialCoordinates, time )
+                distance = distanceToCurrent if distanceToCurrent<distanceToPrevious else distanceToPrevious
+                if distance < self.objectLocationThreshold[detection.label]:
+                    if candidate is not None:
+                        if candidate[1] > distance:  #if further away
+                            candidate = (object, distance)
+                    else:
+                        candidate = (object, distance)
+                else:
+                    if distance > maxDistance:
+                        maxDistance = distance
+        if candidate is None: #no matching objects found, so create new object
+            newObject = TrackedObject(detection.label,detection.spatialCoordinates, time)
+            self.trackedObjects.append(newObject)
+            print(f"new {newObject.getName()} being tracked due to distance = {maxDistance:0.2f}")
+            print(f"{detection.spatialCoordinates.x:0.2f}, {detection.spatialCoordinates.y:0.2f}, {detection.spatialCoordinates.z:0.2f}")
+        else:
+            candidate[0].updateLocation(detection.spatialCoordinates, time)
+            print(f"{candidate[0].getName()} position updated, ({detection.spatialCoordinates.x:0.2f}, {detection.spatialCoordinates.y:0.2f}, {detection.spatialCoordinates.z:0.2f}) distance = {candidate[1]:0.2f}.")
+
+    def computeDistanceOfDetectionFromObject(self, l, c, t):
+        return math.sqrt( (l[0]-c.x)**2 + (l[1]-c.y)**2 + (l[2]-c.z)**2 ) / (t-l[3]) / 100 #scaling factor
+
+class TrackedObject:
+
+
+    def __init__(self):
+        self.ID = 0
+        self.label = 0
+        self.name = 0
+        self.previousLocation = (0, 0, 0, 0)
+        self.currentLocation = (0, 0, 0, 0)
+        self.currentVelocity = (0, 0, 0)
+
+    def __init__(self, label, c, t):
+        self.ID = 0
+        self.label = label
+        try:
+            self.name = labelMap[label]
+        except:
+            self.name = label
+        self.previousLocation = (c.x, c.y, c.z, t)
+        self.currentLocation = (c.x, c.y, c.z,t )
+        self.currentVelocity = (0, 0, 0)
+
+    def updateLocation(self, c, t):
+        #todo: add one euro filter
+        self.previousLocation = (self.currentLocation[0], self.currentLocation[1], self.currentLocation[2], self.currentLocation[3])
+        self.currentLocation = (c.x, c.y, c.z, t)
+
+    def getName(self):
+        return self.name
+        
+        
 
 if __name__ == '__main__':
     print("instantiating vision system.")

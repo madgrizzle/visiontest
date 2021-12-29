@@ -21,6 +21,7 @@ def correct_bb(bb):
     return bb
 
 frameCount = -1
+
 while True:
     time.sleep(0.001)
     preview = node.io['preview'].tryGet()
@@ -101,3 +102,18 @@ while True:
 
         node.io['manip2_cfg'].send(cfg)
         node.io['manip2_img'].send(img)
+        
+    yoloPass=node.io['yoloPass'].tryGet()
+    if yoloPass is not None:
+        yoloPassDepth=node.io['yoloPassDepth'].get()
+        delta = yoloPassDepth.getSequenceNum() - yoloPass.getSequenceNum()
+        if delta == 0:
+            sync = True
+        else:
+            sync = False
+            node.warn(f"out of sync.. {delta}")
+        data = json.dumps(sync).encode('utf-8')
+        buf = Buffer(len(data))
+        buf.setData(data)
+        node.io['yoloSync'].send(buf)
+        
