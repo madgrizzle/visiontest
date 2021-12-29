@@ -8,25 +8,25 @@ The pipeline, in general, does the following (not all nodes are described):
 1) In ImageManip node resizes the camera preview output and feeds them to a face detection NN.
 1) A face detection NN generates an ImgDetections from frames and sends them to the script node.
 2) The ImgDections contains a list of all faces detected.  For each detection, which consists
-   of a bounding box, the script node creates an ImageManipConfig to crop out the faces, 
+   of a bounding box, the script node creates an ImageManipConfig to crop out the faces,
    resize them, and change the output format.  This is sent to an ImageManip node. Note: one
    configuration per face is sent (and there may be more than one face detected per image).
 3) An ImageManip node performs the crop/resize/format change and sends each face to a headpose
    estimator NN.
 4) The headpose estimator NN calculates the headpose and sends them to the script node.
 5) The script node reads (only) the "rotation" value from the headpose estimate and calculates
-   a rotated rectangle for cropping that will work better with the face recognition node.  
+   a rotated rectangle for cropping that will work better with the face recognition node.
    The script creates an ImangeManipConfig with this rotated rectangle and sends to an
    ImageManip node.
 6) An ImageManip node performs the crop and resize and sends each face to a face recognition NN.
 4) The face recognition NN generates features based upon the face image sent.
 
-The pipeline outputs (xlinks) the camera preview output, the face detections, the rotated 
+The pipeline outputs (xlinks) the camera preview output, the face detections, the rotated
 rectangle values, and the face recognition features.
 
 Its important to note that there is a 1:N relationship between face detections and the latter
 outputs of the pipeline.  For each face detection (i.e. ImgDetection) with N number of faces
-detected, there are N number of rotated rectangle values and face recognition features.  
+detected, there are N number of rotated rectangle values and face recognition features.
 
 This pipeline works because all node inputs are blocking and therefore, remain can remain in sync.
 However, if the host does not process all of the output queues fast enough, its possible that
@@ -40,9 +40,9 @@ An option is to create threads where one thread reads the output from the pipeli
 a Queue.  The second thread reads this Queue and outputs to the display.  This way you may miss
 a recognition that that queue overflows because the frame rate is fast, but you don't overrun the
 output queue of a node and lose sync (if this is what is really happening).
+#
 
-
-''' 
+'''
 import os
 import json
 from datetime import timedelta, datetime
@@ -88,8 +88,8 @@ labelMap = [
     "laptop",         "mouse",      "remote",        "keyboard",      "cell phone",  "microwave",     "oven",
     "toaster",        "sink",       "refrigerator",  "book",          "clock",       "vase",          "scissors",
     "teddy bear",     "hair drier", "toothbrush"
-]    
-    
+]
+
 class HostSync:
     def __init__(self):
         self.array = []
@@ -203,61 +203,85 @@ class TrackedObjectManager:
     def __init__(self):
         print("initializing tracked object manager")
         self.trackedObjects = []
-        self.objectLocationThreshold = 20 #20 mm threshold
-        
-    def processDetection(self, detection):
+        self.objectLocationThreshold = [
+            40,               40,           200,              100,            10000,         5000,            6000,
+            300,              400,         100,              300,            500,           200,             50,
+            20,               20,           40,               100,            40,            100,             200,
+            100,             100,           200,              20,             20,            20,              20,
+            30,               20,           20,               20,             20,            100,             20,
+            20,               20,           50,               20,             20,            10,              10,
+            5,                5,             5,               10,             10,            10,              10,
+            5,                5,             5,                5,             20,            5,               20,
+            20,               100,          50,               50,             100,           200,             10,
+            10,               20,           20,               20,             40,            100,             50,
+            50,               50,           100,              5,              100,           20,              20,
+            50,               50,           10,
+        ]
+
+    def processDetection(self, detection, time):
         candidate = None
+        maxDistance = 0
+        distance = -1
         for object in self.trackedObjects:
             if object.label == detection.label:
-                distance = self.computeDistanceOfDetectionFromObject(object.currentLocation, detection.spatialCoordinates )
-                if distance < self.objectLocationThreshold:
+                distanceToCurrent = self.computeDistanceOfDetectionFromObject(object.currentLocation, detection.spatialCoordinates, time )
+                distanceToPrevious = self.computeDistanceOfDetectionFromObject(object.previousLocation, detection.spatialCoordinates, time )
+                distance = distanceToCurrent if distanceToCurrent<distanceToPrevious else distanceToPrevious
+                if distance < self.objectLocationThreshold[detection.label]:
                     if candidate is not None:
                         if candidate[1] > distance:  #if further away
                             candidate = (object, distance)
                     else:
                         candidate = (object, distance)
+                else:
+                    if distance > maxDistance:
+                        maxDistance = distance
         if candidate is None: #no matching objects found, so create new object
-            newObject = TrackedObject(detection.label,detection.spatialCoordinates)
+            newObject = TrackedObject(detection.label,detection.spatialCoordinates, time)
             self.trackedObjects.append(newObject)
-            print(f"new {newObject.getName()} being tracked")
+            print(f"new {newObject.getName()} being tracked due to distance = {maxDistance:0.2f}")
+            print(f"{detection.spatialCoordinates.x:0.2f}, {detection.spatialCoordinates.y:0.2f}, {detection.spatialCoordinates.z:0.2f}")
         else:
-            candidate[0].updateLocation(detection.spatialCoordinates)
-            print(f"{candidate[0].getName()} position updated.")
-                
-    def computeDistanceOfDetectionFromObject(self, l, c):
-        return math.sqrt( (l[0]-c.x)**2 + (l[1]-c.y)**2 + (l[2]-c.z)**2 )
-        
+            candidate[0].updateLocation(detection.spatialCoordinates, time)
+            print(f"{candidate[0].getName()} position updated, ({detection.spatialCoordinates.x:0.2f}, {detection.spatialCoordinates.y:0.2f}, {detection.spatialCoordinates.z:0.2f}) distance = {candidate[1]:0.2f}.")
+
+    def computeDistanceOfDetectionFromObject(self, l, c, t):
+        return math.sqrt( (l[0]-c.x)**2 + (l[1]-c.y)**2 + (l[2]-c.z)**2 ) / (t-l[3]) / 10 #scaling factor
+
 class TrackedObject:
 
-    
+
     def __init__(self):
         self.ID = 0
         self.label = 0
         self.name = 0
-        self.currentLocation = (0, 0, 0)
+        self.previousLocation = (0, 0, 0, 0)
+        self.currentLocation = (0, 0, 0, 0)
         self.currentVelocity = (0, 0, 0)
-        
-    def __init__(self, label, c):
+
+    def __init__(self, label, c, t):
         self.ID = 0
         self.label = label
         try:
             self.name = labelMap[label]
         except:
             self.name = label
-        self.currentLocation = (c.x, c.y, c.z)
+        self.previousLocation = (c.x, c.y, c.z, t)
+        self.currentLocation = (c.x, c.y, c.z,t )
         self.currentVelocity = (0, 0, 0)
-        
-    def updateLocation(self, c):
+
+    def updateLocation(self, c, t):
         #todo: add one euro filter
-        self.currentLocation = (c.x, c.y, c.z)
-        
+        self.previousLocation = (self.currentLocation[0], self.currentLocation[1], self.currentLocation[2], self.currentLocation[3])
+        self.currentLocation = (c.x, c.y, c.z, t)
+
     def getName(self):
         return self.name
-        
-    
-        
-        
-        
+
+
+
+
+
 class VisionSystem:
 
     def __init__(self):
@@ -265,45 +289,45 @@ class VisionSystem:
         print(dai.__version__)
         parser = argparse.ArgumentParser()
         parser.add_argument("-name", "--name", type=str, help="Name of the person for database saving")
-        self.args = parser.parse_args() 
+        self.args = parser.parse_args()
         self.packageDir = "."
-            
+
         self.databases = self.packageDir+"/databases"
         print(self.databases)
         if not os.path.exists(self.databases):
             os.mkdir(self.databases)
-        
 
-        
+
+
         self.pipeline = self.createPipeline()
-        
+
         self.device = dai.Device(self.pipeline)
         cameraInfo = self.device.getCameraSensorNames()
         cameraModel = cameraInfo[dai.CameraBoardSocket.RGB]
         if cameraModel == "IMX214":
             self.FPS = 30
-            self.frameSkip = 6
+            self.frameSkip = 4
         else:
             self.FPS = 30
-            self.frameSkip = 6
-        
+            self.frameSkip = 4
+
         if PREVIEW:
             self.frameQ = self.device.getOutputQueue("frame", 15, False)
         self.recCfgQ = self.device.getOutputQueue("face_rec_cfg_out", 15, False)
         self.arcQ = self.device.getOutputQueue("arc_out", 15, False)
         self.detQ = self.device.getOutputQueue("faceDetections", 15, False)
         self.cameraControlQ = self.device.getInputQueue("cameraControl",4,False)
-       
+
         self.recognizeFaceQueue = Queue(maxsize = 10)
-        
+
         self.faceThread = threading.Thread(target=self.runFaceDetectThread)
         self.faceThread.daemon = True
         self.faceThread.start()
-  
+
         self.recognizeThread = threading.Thread(target=self.runRecognizeFaceThread)
         self.recognizeThread.daemon = True
         self.recognizeThread.start()
-        
+
         if OBJECT:
             self.objectQ = self.device.getOutputQueue(name="objectDetections", maxSize=15, blocking=False)
             self.videoDisplayObjectQueue = Queue(maxsize = 20)
@@ -311,8 +335,8 @@ class VisionSystem:
             self.objectThread = threading.Thread(target=self.runObjectThread)
             self.objectThread.daemon = True
             self.objectThread.start()
-        
-  
+
+
         if PREVIEW:
             print("Running display thread.")
             self.videoDisplayFaceQueue = Queue(maxsize = 20)
@@ -326,8 +350,8 @@ class VisionSystem:
             self.raylibDisplayThread = threading.Thread(target=self.runRaylibDisplayThread)
             self.raylibDisplayThread.daemon = True
             self.raylibDisplayThread.start()
-            
-            
+
+
     def runFaceDetectThread(self):
         results = {}
         while True:
@@ -362,7 +386,7 @@ class VisionSystem:
                     if self.recognizeFaceQueue.full():
                         self.recognizeFaceQueue.get()
                     self.recognizeFaceQueue.put(result)
-    
+
     def runRecognizeFaceThread(self):
         facerec = FaceRecognition(self.databases, self.args.name)
         # once face recognition is up and running, turn on the frame processing
@@ -372,7 +396,7 @@ class VisionSystem:
         buffer = dai.Buffer()
         buffer.setData(list(data))
         self.cameraControlQ.send(buffer)
-        
+
         while True:
             time.sleep(0.001)
             if not self.recognizeFaceQueue.empty():
@@ -385,7 +409,7 @@ class VisionSystem:
                     self.videoDisplayFaceQueue.put(result)
                 if DISPLAY_FACE:
                     self.raylibDisplayFaceQueue.put(result)
-                  
+
     def runObjectThread(self):
         time.sleep(0.001)
         while True:
@@ -395,14 +419,14 @@ class VisionSystem:
                 if PREVIEW:
                     self.videoDisplayObjectQueue.put(detections)
                 if len(detections)>0:
-                    for detection in detections:    
+                    for detection in detections:
                         try:
                             label = labelMap[detection.label]
                         except:
                             label = detection.label
-                        self.trackedObjectManager.processDetection(detection)
+                        self.trackedObjectManager.processDetection(detection, time.time())
                         #print(f"{label} at {detection.spatialCoordinates.x:.2f}, {detection.spatialCoordinates.y:.2f}, {detection.spatialCoordinates.z:.2f}")
-    
+
     def runRaylibDisplayThread(self):
         text = TextHelper()
 
@@ -435,14 +459,14 @@ class VisionSystem:
                     ray.end_drawing()
             ray.unload_texture(texture)
             ray.close_window()
-    
+
     def runVideoDisplayThread(self):
         text = TextHelper()
         frameDelay = 0
         frameArr = []
-        frame = None    
+        frame = None
         while True:
-            time.sleep(0.001)        
+            time.sleep(0.001)
             frameIn = self.frameQ.tryGet()
             if frameIn is not None:
                 frameArr.append(frameIn.getCvFrame())
@@ -463,7 +487,7 @@ class VisionSystem:
                     text.putText(frame, f"x:{result['x']:0.2f}", (result['coords'][0],result['coords'][1]+30))
                     text.putText(frame, f"y:{result['y']:0.2f}", (result['coords'][0],result['coords'][1]+60))
                     text.putText(frame, f"z:{result['z']:0.2f}", (result['coords'][0],result['coords'][1]+90))
-                    
+
                 if OBJECT:
                     if not self.videoDisplayObjectQueue.empty():
                         detections = self.videoDisplayObjectQueue.get()
@@ -486,7 +510,7 @@ class VisionSystem:
                 cv2.imshow("color", cv2.resize(frame, (800,800)))
                 if cv2.waitKey(1) == ord('q'):
                     break
-    
+
 
 
     def createPipeline(self):
@@ -494,7 +518,7 @@ class VisionSystem:
         pipeline = dai.Pipeline()
         pipeline.setOpenVINOVersion(version=dai.OpenVINO.Version.VERSION_2021_4)
         openvino_version = '2021.4'
-    
+
         print("Creating Color Camera...")
         cam = pipeline.create(dai.node.ColorCamera)
         # For ImageManip rotate you need input frame of multiple of 16
@@ -504,17 +528,17 @@ class VisionSystem:
         cam.setInterleaved(False)
         cam.setBoardSocket(dai.CameraBoardSocket.RGB)
         cam.setFps(30) #this will be 'paced' by the script by a factor of 6, so 5 FPS
-    
+
         if PREVIEW:
             host_face_out = pipeline.create(dai.node.XLinkOut)
             host_face_out.setStreamName('frame')
             cam.video.link(host_face_out.input)
-    
+
         # ImageManip that will crop the frame before sending it to the Face detection NN node
         face_det_manip = pipeline.create(dai.node.ImageManip)
         face_det_manip.initialConfig.setResize(300, 300)
         face_det_manip.initialConfig.setFrameType(dai.RawImgFrame.Type.RGB888p)
-    
+
         # NeuralNetwork
         print("Creating Face Detection Neural Network...")
         face_det_nn = pipeline.create(dai.node.MobileNetSpatialDetectionNetwork)
@@ -525,59 +549,59 @@ class VisionSystem:
             version=openvino_version
         ))
         face_det_nn.setBoundingBoxScaleFactor(0.50)
-        face_det_nn.setDepthLowerThreshold(0)
+        face_det_nn.setDepthLowerThreshold(10)
         face_det_nn.setDepthUpperThreshold(5000)
-        face_det_nn.setConfidenceThreshold(0.1)
+        face_det_nn.setConfidenceThreshold(0.3)
         face_det_nn.setSpatialCalculationAlgorithm(dai.SpatialLocationCalculatorAlgorithm.MIN)
-        
+
         # Link Face ImageManip -> Face detection NN node
         face_det_manip.out.link(face_det_nn.input)
-    
+
         # Script node will take the output from the face detection NN as an input and set ImageManipConfig
         # to the 'age_gender_manip' to crop the initial frame
         script = pipeline.create(dai.node.Script)
         script.setProcessor(dai.ProcessorType.LEON_CSS)
-    
+
         face_det_nn.out.link(script.inputs['face_det_in'])
-        
+
         face_detections_out = pipeline.create(dai.node.XLinkOut)
         face_detections_out.setStreamName('faceDetections')
         face_det_nn.out.link(face_detections_out.input)
-    
+
         # We are only interested in timestamp, so we can sync depth frames with NN output
         face_det_nn.passthrough.link(script.inputs['face_pass'])
-    
+
         with open("spatialScript.py", "r") as f:
             script.setScript(f.read())
-    
+
         # create a camera control XLINKIN to script
         cameraControlxin = pipeline.create(dai.node.XLinkIn)
         cameraControlxin.setStreamName('cameraControl')
         cameraControlxin.out.link(script.inputs['cameraControl'])
-        
+
         # ImageManip as a workaround to have more frames in the pool.
         # cam.preview can only have 4 frames in the pool before it will
         # wait (freeze). Copying frames and setting ImageManip pool size to
         # higher number will fix this issue.
-        
-        
+
+
         copy_manip = pipeline.create(dai.node.ImageManip)
         cam.preview.link(copy_manip.inputImage)
         copy_manip.setNumFramesPool(20)
         copy_manip.setMaxOutputFrameSize(1072*1072*3)
-    
+
         #copy_manip.out.link(face_det_manip.inputImage)
         script.outputs['pacedPreview'].link(face_det_manip.inputImage)
         copy_manip.out.link(script.inputs['preview'])
-    
+
         print("Creating Head pose estimation NN")
         headpose_manip = pipeline.create(dai.node.ImageManip)
         headpose_manip.setWaitForConfigInput(True) # needed to maintain sync
         headpose_manip.initialConfig.setResize(60, 60)
-    
+
         script.outputs['manip_cfg'].link(headpose_manip.inputConfig)
         script.outputs['manip_img'].link(headpose_manip.inputImage)
-    
+
         headpose_nn = pipeline.create(dai.node.NeuralNetwork)
         headpose_nn.setBlobPath(blobconverter.from_zoo(
             name="head-pose-estimation-adas-0001",
@@ -585,30 +609,30 @@ class VisionSystem:
             version=openvino_version
         ))
         headpose_manip.out.link(headpose_nn.input)
-    
+
         headpose_nn.out.link(script.inputs['headpose_in'])
         headpose_nn.passthrough.link(script.inputs['headpose_pass'])
-    
+
         print("Creating face recognition ImageManip/NN")
-    
+
         face_rec_manip = pipeline.create(dai.node.ImageManip)
         face_rec_manip.setWaitForConfigInput(True) # needed to maintain sync
         face_rec_manip.initialConfig.setResize(112, 112)
         #face_rec_manip.initialConfig.setResize(128, 128)
-    
+
         script.outputs['manip2_cfg'].link(face_rec_manip.inputConfig)
         script.outputs['manip2_img'].link(face_rec_manip.inputImage)
-    
+
         face_rec_cfg_out = pipeline.create(dai.node.XLinkOut)
         face_rec_cfg_out.setStreamName('face_rec_cfg_out')
         script.outputs['manip2_cfg'].link(face_rec_cfg_out.input)
-    
+
         # Only send metadata for the host-side sync
         # pass2_out = pipeline.create(dai.node.XLinkOut)
         # pass2_out.setStreamName('pass2')
         # pass2_out.setMetadataOnly(True)
         # script.outputs['manip2_img'].link(pass2_out.input)
-    
+
         face_rec_nn = pipeline.create(dai.node.NeuralNetwork)
         # Removed from OMZ, so we can't use blobconverter for downloading, see here:
         # https://github.com/openvinotoolkit/open_model_zoo/issues/2448#issuecomment-851435301
@@ -618,33 +642,33 @@ class VisionSystem:
             shaves=6,
             version=self.openvinoVersion
         )))
-        
+
         face_rec_manip.out.link(face_rec_nn.input)
-    
+
         if DISPLAY_FACE:
             xout_face = pipeline.createXLinkOut()
             xout_face.setStreamName('face')
             face_rec_manip.out.link(xout_face.input)
-    
+
         arc_out = pipeline.create(dai.node.XLinkOut)
         arc_out.setStreamName('arc_out')
         face_rec_nn.out.link(arc_out.input)
-    
+
         monoLeft = pipeline.create(dai.node.MonoCamera)
         monoRight = pipeline.create(dai.node.MonoCamera)
         stereo = pipeline.create(dai.node.StereoDepth)
-          
+
         stereo.initialConfig.setConfidenceThreshold(255)
-            
+
         monoLeft.setResolution(dai.MonoCameraProperties.SensorResolution.THE_400_P)
         monoLeft.setBoardSocket(dai.CameraBoardSocket.LEFT)
         monoRight.setResolution(dai.MonoCameraProperties.SensorResolution.THE_400_P)
         monoRight.setBoardSocket(dai.CameraBoardSocket.RIGHT)
-          
+
         monoLeft.out.link(stereo.left)
         monoRight.out.link(stereo.right)
         stereo.depth.link(face_det_nn.inputDepth)
-        
+
         if OBJECT:
             # Create object detection NN
             print("Creating Object Detection Neural Network...")
@@ -654,10 +678,10 @@ class VisionSystem:
                 zoo_type="depthai",
                 shaves=6,
             )))
-          
+
             yoloDetectionNetwork.setConfidenceThreshold(0.5)
             yoloDetectionNetwork.input.setBlocking(False)
-            yoloDetectionNetwork.setBoundingBoxScaleFactor(0.5)
+            yoloDetectionNetwork.setBoundingBoxScaleFactor(0.25)
             yoloDetectionNetwork.setDepthLowerThreshold(100)
             yoloDetectionNetwork.setDepthUpperThreshold(5000)
 
@@ -678,7 +702,7 @@ class VisionSystem:
             xoutNN = pipeline.create(dai.node.XLinkOut)
             xoutNN.setStreamName("objectDetections")
             yoloDetectionNetwork.out.link(xoutNN.input)
-        
+
         return pipeline
 
 
@@ -689,8 +713,3 @@ if __name__ == '__main__':
       time.sleep(0.001)
       if False:
          break
-
-
-
-
-
