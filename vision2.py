@@ -208,7 +208,8 @@ class VisionSystem:
         parser.add_argument("-name", "--name", type=str, help="Name of the person for database saving")
         self.args = parser.parse_args()
         self.packageDir = "."
-
+        self.depthSync = False #start off out of sync
+        
         self.databases = self.packageDir+"/databases"
         print(self.databases)
         if not os.path.exists(self.databases):
@@ -233,7 +234,9 @@ class VisionSystem:
         self.recCfgQ = self.device.getOutputQueue("face_rec_cfg_out", 15, False)
         self.arcQ = self.device.getOutputQueue("arc_out", 15, False)
         self.detQ = self.device.getOutputQueue("faceDetections", 15, False)
+        self.headposeQ = self.device.getOutputQueue("headpose_out", 15, False)
         self.cameraControlQ = self.device.getInputQueue("cameraControl",4,False)
+        
 
         self.recognizeFaceQueue = Queue(maxsize = 10)
 
@@ -247,7 +250,7 @@ class VisionSystem:
 
         if OBJECT:
             self.objectQ = self.device.getOutputQueue(name="objectDetections", maxSize=15, blocking=False)
-            self.yoloSyncQ = self.device.getOutputQueue(name="yoloSyncOut", maxSize=15, blocking=False)
+            self.depthSyncQ = self.device.getOutputQueue(name="depthSyncOut", maxSize=15, blocking=False)
             self.videoDisplayObjectQueue = Queue(maxsize = 20)
             self.trackedObjectManager = TrackedObjectManager()
             self.objectThread = threading.Thread(target=self.runObjectThread)
@@ -279,6 +282,7 @@ class VisionSystem:
                 for det in inDet.detections:
                     cfg = self.recCfgQ.get()
                     arcIn = self.arcQ.get()
+                    headpose = self.headposeQ.get()
                     if DISPLAY_FACE:
                         face = self.faceQ.get()
                     rr = cfg.getRaw().cropConfig.cropRotatedRect
@@ -288,16 +292,24 @@ class VisionSystem:
                     rotatedRect = (center, size, rr.angle)
                     points = np.int0(cv2.boxPoints(rotatedRect))
                     features = np.array(arcIn.getFirstLayerFp16())
+                    values = self.to_tensor_result(headpose)
                     result = {
                         'name': "",
                         'conf': "",
                         'coords': center,
                         'points': points,
                         'ts': time.time(),
+                        'xmin': det.xmin,
+                        'ymin': det.ymin,
+                        'xmax': det.xmax,
+                        'ymax': det.ymax,
                         'x': det.spatialCoordinates.x,
                         'y': det.spatialCoordinates.y,
                         'z': det.spatialCoordinates.z,
                         'features': features,
+                        'yaw': values['angle_y_fc'][0][0],
+                        'pitch': values['angle_p_fc'][0][0],
+                        'roll': values['angle_r_fc'][0][0],                        
                     }
                     if DISPLAY_FACE:
                         result['face']=face
@@ -305,6 +317,14 @@ class VisionSystem:
                         self.recognizeFaceQueue.get()
                     self.recognizeFaceQueue.put(result)
 
+    def to_tensor_result(self, packet):
+        return {
+            tensor.name: np.array(packet.getLayerFp16(tensor.name)).reshape(tensor.dims)
+            for tensor in packet.getRaw().tensors
+        }
+    
+    
+    
     def runRecognizeFaceThread(self):
         facerec = FaceRecognition(self.databases, self.args.name)
         # once face recognition is up and running, turn on the frame processing
@@ -327,39 +347,41 @@ class VisionSystem:
                     self.videoDisplayFaceQueue.put(result)
                 if DISPLAY_FACE:
                     self.raylibDisplayFaceQueue.put(result)
-
+                if self.depthSync == 1:  #we are using the sync message in the runObjectThread to make sure depth/stereo frames are in sync. 
+                    self.trackedObjectManager.processFaceDetection(result, time.time())  # done this way to easier know if multiple items exist
+                
     def runObjectThread(self):
         time.sleep(0.001)
         while True:
             inDet = self.objectQ.tryGet()
             if inDet is not None:
                 detections = inDet.detections
-                data = self.yoloSyncQ.get().getData()
+                data = self.depthSyncQ.get().getData()
                 jsonstr = str(data, 'utf-8')
-                yoloSync = json.loads(jsonstr)
+                self.depthSync = json.loads(jsonstr)
                 if PREVIEW:
                     self.videoDisplayObjectQueue.put(detections)
-                if yoloSync == 1 and len(detections)>0:
+                if self.depthSync == 1 and len(detections)>0:
                     for detection in detections:
                         try:
                             label = labelMap[detection.label]
                         except:
                             label = detection.label
-                    self.trackedObjectManager.processDetections(detections, time.time())  # done this way to easier know if multiple items exist
+                    self.trackedObjectManager.processObjectDetections(detections, time.time())  # done this way to easier know if multiple items exist
                         #print(f"{label} at {detection.spatialCoordinates.x:.2f}, {detection.spatialCoordinates.y:.2f}, {detection.spatialCoordinates.z:.2f}")
 
     def runRaylibDisplayThread(self):
         text = TextHelper()
 
-        ray.init_window(800, 450, "Hello Raylib")
-        #ray.toggle_fullscreen()
+        ray.init_window(1024, 600, "Hello Raylib")
+        ray.toggle_fullscreen()
         ray.hide_cursor()
         ray.set_target_fps(60)
         ray.set_trace_log_level(ray.LOG_ERROR)
-        #width = ray.get_screen_width()
-        #height = ray.get_screen_height()
-        width = 800
-        height = 450
+        width = ray.get_screen_width()
+        height = ray.get_screen_height()
+        #width = 800
+        #height = 450
         print(width)
         while True:
             time.sleep(0.001)
@@ -367,19 +389,59 @@ class VisionSystem:
                 if not self.raylibDisplayFaceQueue.empty():
                     result=self.raylibDisplayFaceQueue.get()
                     frame = result['face'].getCvFrame()
-                    rayframe = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                    ffiData = ray.ffi.from_buffer(rayframe.data)
+                    #frame = self.draw_3d_axis(frame, int(frame.shape[1]/2), int(frame.shape[0]/2), result['yaw'], result['pitch'], result['roll'])
+                    h0, w0 = frame.shape[:2]
+                    frame = cv2.resize(frame, (w0*4, h0*4), interpolation=cv2.INTER_LANCZOS4)
+                    frame = cv2.Canny(frame, 25, 100)
+                    frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    ffiData = ray.ffi.from_buffer(frame.data)
                     image = ray.Image(ffiData,frame.shape[1],frame.shape[0],1,ray.PIXELFORMAT_UNCOMPRESSED_R8G8B8)
                     texture = ray.load_texture_from_image(image)
                     #ray.unload_image(image)
                     ray.begin_drawing()
-                    ray.clear_background(ray.RAYWHITE)
-                    scale = 450/frame.shape[0]
-                    vector = ray.Vector2(int(200-frame.shape[1]/2), 0)
-                    ray.draw_texture_ex(texture, vector, 0, scale, ray.WHITE)
+                    ray.clear_background(ray.BLACK)
+                    scale = width/frame.shape[0]
+                    scale1 = height/frame.shape[1]
+                    if scale>scale1:
+                        scale = scale1
+                    #vector = ray.Vector2(int(200-frame.shape[1]/2), 0)
+                    vector = ray.Vector2(int((width-height)/2),height)
+                    ray.draw_texture_ex(texture, vector, -90, scale, ray.RAYWHITE)
                     ray.end_drawing()
             ray.unload_texture(texture)
             ray.close_window()
+    
+    def draw_3d_axis(self, frame, origin_x, origin_y, y, p, r):
+        size = 50
+        yaw = y*3.141592/180
+        pitch = p*3.141592/180
+        roll = r*3.141592/180
+        
+        sinY = math.sin(yaw)
+        sinP = math.sin(pitch)
+        sinR = math.sin(roll)
+        
+        cosY = math.cos(yaw)
+        cosP = math.cos(pitch)
+        cosR = math.cos(roll)
+        
+        # X axis (red)
+        x1 = origin_x + size * (cosR * cosY + sinY * sinP * sinR)
+        y1 = origin_y + size * cosP * sinR
+        cv2.line(frame, (origin_x, origin_y), (int(x1), int(y1)), (0, 0, 255), 1)
+
+        # Y axis (green)
+        x2 = origin_x + size * (cosR * sinY * sinP + cosY * sinR)
+        y2 = origin_y - size * cosP * cosR
+        cv2.line(frame, (origin_x, origin_y), (int(x2), int(y2)), (0, 255, 0), 1)
+
+        # Z axis (blue)
+        x3 = origin_x + size * (sinY * cosP)
+        y3 = origin_y + size * sinP
+        cv2.line(frame, (origin_x, origin_y), (int(x3), int(y3)), (255, 0, 0), 1)
+
+        return frame
+
 
     def runVideoDisplayThread(self):
         text = TextHelper()
@@ -530,9 +592,18 @@ class VisionSystem:
             version=openvino_version
         ))
         headpose_manip.out.link(headpose_nn.input)
+        
+        if DISPLAY_FACE:
+            xout_face = pipeline.createXLinkOut()
+            xout_face.setStreamName('face')
+            headpose_manip.out.link(xout_face.input)
 
         headpose_nn.out.link(script.inputs['headpose_in'])
         headpose_nn.passthrough.link(script.inputs['headpose_pass'])
+        
+        headpose_out = pipeline.create(dai.node.XLinkOut)
+        headpose_out.setStreamName('headpose_out')
+        headpose_nn.out.link(headpose_out.input)
 
         print("Creating face recognition ImageManip/NN")
 
@@ -565,11 +636,6 @@ class VisionSystem:
         )))
 
         face_rec_manip.out.link(face_rec_nn.input)
-
-        if DISPLAY_FACE:
-            xout_face = pipeline.createXLinkOut()
-            xout_face.setStreamName('face')
-            face_rec_manip.out.link(xout_face.input)
 
         arc_out = pipeline.create(dai.node.XLinkOut)
         arc_out.setStreamName('arc_out')
@@ -628,9 +694,9 @@ class VisionSystem:
             yoloDetectionNetwork.passthrough.link(script.inputs['yoloPass'])
             yoloDetectionNetwork.passthroughDepth.link(script.inputs['yoloPassDepth'])
 
-            yoloSync_out = pipeline.create(dai.node.XLinkOut)
-            yoloSync_out.setStreamName('yoloSyncOut')
-            script.outputs['yoloSync'].link(yoloSync_out.input)
+            depthSync_out = pipeline.create(dai.node.XLinkOut)
+            depthSync_out.setStreamName('depthSyncOut')
+            script.outputs['depthSync'].link(depthSync_out.input)
             
             
         return pipeline
@@ -663,47 +729,100 @@ class TrackedObjectManager:
             50,               50,           10,
         ]
 
-    def processDetections(self, detections, time):
+    def processObjectDetections(self, detections, time):
         #determine how many of each label exists in frame and if quantity is less than what's tracked, create a new one
         labels = []
         for detection in detections:
             labels.append(detection.label)
         objects = Counter(labels)
+        print(objects)
         for object in objects:
+            numberOfObjectsToAdd = 0
             if object in self.trackedObjectsTracker:
                 count = self.trackedObjectsTracker[object]["count"]
                 if count < objects[object]:
-                    newObject = TrackedObject(object, None, 0)
-                    self.trackedObjects.append(newObject)
-                    self.addNewTrackedObjectToTracker(newObject)
-                    print(f"new object {newObject.name} tracked")
+                    numberOfObjectsToAdd = objects[object]-count
             else:
-                for x in range(objects[object]):
-                    newObject = TrackedObject(object, None, 0)
+                numberOfObjectsToAdd = objects[object]
+            if numberOfObjectsToAdd>0:
+                for x in range(numberOfObjectsToAdd):
+                    if object == 0: #person
+                        newObject = TrackedPerson(object, None, 0)
+                    else:
+                        newObject = TrackedObject(object, None, 0)
                     self.trackedObjects.append(newObject)
                     self.addNewTrackedObjectToTracker(newObject)
                     print(f"new object {newObject.name} tracked")
-                    
+        
         for detection in detections:
             candidate = None
             minDistance = 99999
-            distance = -1
             for object in self.trackedObjects:
                 if object.label == detection.label:
-                    distanceToCurrent = self.computeDistanceOfDetectionFromObject(object.currentLocation, detection.spatialCoordinates, time )
-                    distanceToPrevious = self.computeDistanceOfDetectionFromObject(object.previousLocation, detection.spatialCoordinates, time )
-                    distance = distanceToCurrent if distanceToCurrent<distanceToPrevious else distanceToPrevious
+                    #if object.label == 0:
+                    if False: #I think we should always track person coordinates to person coordinates.
+                        distanceToCurrentFace = self.computeDistanceOfDetectionFromObject(object.currentFaceLocation, detection.spatialCoordinates, time )
+                        distanceToPreviousFace = self.computeDistanceOfDetectionFromObject(object.previousFaceLocation, detection.spatialCoordinates, time )
+                        distance = distanceToCurrentFace if distanceToCurrentFace<distanceToPreviousFace else distanceToPreviousFace
+                    else:
+                        distanceToCurrent = self.computeDistanceOfDetectionFromObject(object.currentLocation, detection.spatialCoordinates, time )
+                        distanceToPrevious = self.computeDistanceOfDetectionFromObject(object.previousLocation, detection.spatialCoordinates, time ) if distanceToCurrent<=6000 else 7000
+                        distance = distanceToCurrent if distanceToCurrent<distanceToPrevious else distanceToPrevious
                     if distance < minDistance:
                         minDistance = distance
                         candidate = object
-            candidate.updateLocation(detection.spatialCoordinates, time)
-            print(f"{candidate.getName()} position updated, ({detection.spatialCoordinates.x:0.2f}, {detection.spatialCoordinates.y:0.2f}, {detection.spatialCoordinates.z:0.2f}) distance = {minDistance}.")
+            candidate.updateLocation(detection, time)
+            #print(f"{candidate.getName()} position updated, ({detection.spatialCoordinates.x:0.2f}, {detection.spatialCoordinates.y:0.2f}, {detection.spatialCoordinates.z:0.2f}) distance = {minDistance}.")
+        self.reportTrackedObjects()
 
+    def processFaceDetection(self, result, time):
+        #determine how many of each label exists in frame and if quantity is less than what's tracked, create a new one
+        if result["name"] == "UNKNOWN":
+            return #not sure what to do here.. if an unknown person lasts long enough, then need to process through adding them to the face recognition database
+        candidate = None
+        maxArea = 0
+        spatial = dai.Point3f(result["x"], result["y"], result["z"])
+        bb = (result["xmin"], result["ymin"], result["xmax"], result["ymax"])
+        for object in self.trackedObjects: #find best match.
+            if object.name == "person":
+                #distanceToCurrent = self.computeDistanceOfDetectionFromObject(object.currentLocation, spatial, time )
+                #distanceToPrevious = self.computeDistanceOfDetectionFromObject(object.previousLocation, spatial, time ) if distanceToCurrent<=6000 else 7000
+                overlapOfCurrent = self.computeOverlap(object.currentBoundingBox, bb, time)
+                overlapOfPrevious = self.computeOverlap(object.previousBoundingBox, bb, time)
+                area = overlapOfCurrent if overlapOfCurrent>overlapOfPrevious else overlapOfPrevious
+                if area > maxArea:
+                    maxArea = area
+                    candidate = object
+        if candidate is not None:
+            candidate.updateName(result["name"])
+            candidate.updateFaceLocation(spatial, time)
+            
+
+    def reportTrackedObjects(self):
+        for object in self.trackedObjects:
+            if object.label == 0: #person
+                print(f"{object.name} at {object.currentLocation[0]:.2f}, {object.currentLocation[1]:.2f}, {object.currentLocation[2]:.2f} face at {object.currentFaceLocation[0]:.2f}, {object.currentFaceLocation[1]:.2f}, {object.currentFaceLocation[2]:.2f}")
+            else:
+                print(f"{object.name} at {object.currentLocation[0]:.2f}, {object.currentLocation[1]:.2f}, {object.currentLocation[2]:.2f}")
+        print("#--------#")
+                
     def computeDistanceOfDetectionFromObject(self, l, c, t):
         if l[3]>0:
-            return math.sqrt( (l[0]-c.x)**2 + (l[1]-c.y)**2 + (l[2]-c.z)**2 ) / (t-l[3]) / 100 #scaling factor
+            if t-l[3]>0.01: # if its 0 (means new object) or if the timestamp has not been updated (meaning its already been matched), do this
+                return math.sqrt( (l[0]-c.x)**2 + (l[1]-c.y)**2 + (l[2]-c.z)**2 ) /100 #/ (t-l[3]) / 100 #scaling factor
+            else:
+                return 7000
         else:
-            return 5000
+            return 6000 #return something far away.. 
+
+    def computeOverlap(self, l, c, t):
+        dx = min(l[2], c[2]) - max(l[0], c[0])
+        dy = min(l[3], c[3]) - max(l[1], c[1])
+        if (dx>=0) and (dy>=0):
+            return dx*dy
+        else:
+            return 0
+        
 
     def addNewTrackedObjectToTracker(self, newObject):
         if newObject.label in self.trackedObjectsTracker:
@@ -712,8 +831,8 @@ class TrackedObjectManager:
         self.trackedObjectsTracker[newObject.label]={"name":newObject.name, "count":1}
                 
             
-class TrackedObject:
 
+class TrackedObject:
 
     def __init__(self):
         self.ID = 0
@@ -722,6 +841,8 @@ class TrackedObject:
         self.previousLocation = (0, 0, 0, 0)
         self.currentLocation = (0, 0, 0, 0)
         self.futureLocation = (0, 0, 0, 0)
+        self.previousBoundingBox = (0, 0, 0, 0, 0)
+        self.currentBoundingBox = (0, 0, 0, 0, 0)
 
     def __init__(self, label, c, t):
         self.ID = 0
@@ -731,24 +852,40 @@ class TrackedObject:
         except:
             self.name = label
         if c is not None:
-            self.previousLocation = (c.x, c.y, c.z, t)
-            self.currentLocation = (c.x, c.y, c.z,t )
-            self.futureLocation = (c.x, c.y, c.z,t )
+            self.previousLocation = (c.spatialCoordinates.x, c.spatialCoordinates.y, c.spatialCoordinates.z, t)
+            self.currentLocation = (c.spatialCoordinates.x, c.spatialCoordinates.y, c.spatialCoordinates.z,t )
+            self.futureLocation = (c.spatialCoordinates.x, c.spatialCoordinates.y, c.spatialCoordinates.z,t )
+            self.previousBoundingBox = (c.xmin, c.ymin, c.xmax, c.ymax, t)
+            self.currentBoundingBox = (c.xmin, c.ymin, c.xmax, c.ymax, t)
         else:
             self.previousLocation = (0, 0, 0, t)
             self.currentLocation = (0, 0, 0, t)
             self.futureLocation = (0, 0, 0, t)
+            self.previousBoundingBox = (0, 0, 0, 0, t)
+            self.currentBoundingBox = (0, 0, 0, 0, t)
+                
+    def updateName(self, name):
+        self.name = name
         
-
     def updateLocation(self, c, t):
         #todo: add one euro filter or kalman filter
         self.previousLocation = (self.currentLocation[0], self.currentLocation[1], self.currentLocation[2], self.currentLocation[3])
-        self.currentLocation = (c.x, c.y, c.z, t)
+        self.currentLocation = (c.spatialCoordinates.x, c.spatialCoordinates.y, c.spatialCoordinates.z, t)
+        self.previousBoundingBox = (self.currentBoundingBox[0], self.currentBoundingBox[1], self.currentBoundingBox[2], self.currentBoundingBox[3], self.currentBoundingBox[4])
+        self.currentBoundingBox = (c.xmin, c.ymin, c.xmax, c.ymax, t)
 
     def getName(self):
         return self.name
         
-        
+class TrackedPerson(TrackedObject):
+    def __init__(self, label, c, t):
+        self.currentFaceLocation = (0, 0, 0, 0)
+        self.previousFaceLocation = (0, 0, 0, 0)
+        TrackedObject.__init__(self, label, c, t)
+    
+    def updateFaceLocation(self, c, t):
+        self.previousFaceLocation = (self.currentFaceLocation[0], self.currentFaceLocation[1], self.currentFaceLocation[2], self.currentFaceLocation[3])
+        self.currentFaceLocation = (c.x, c.y, c.z, t)
 
 if __name__ == '__main__':
     print("instantiating vision system.")

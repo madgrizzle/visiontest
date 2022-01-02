@@ -115,5 +115,5 @@ while True:
         data = json.dumps(sync).encode('utf-8')
         buf = Buffer(len(data))
         buf.setData(data)
-        node.io['yoloSync'].send(buf)
+        node.io['depthSync'].send(buf)
         
